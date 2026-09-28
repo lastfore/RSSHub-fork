@@ -1,4 +1,5 @@
 .DS_Store
+.codegraph/
 .cursorrules
 .devenv
 .direnv
@@ -42,3 +43,5 @@ yarn.lock
 yarn-error.log
 
 dist-container
+
+.codegraph/
