@@ -29,23 +29,43 @@ export const route: Route = {
     maintainers: ['nczitzk'],
     handler,
     url: 'www.gov.cn/zhengce/',
-    description: `| 最新政策 | 政策解读 | 图解政策    |
+    description: `最新政策（zuixin）列表来自 ZUIXINZHENGCE.json，页面 HTML 仅作兜底。
+
+| 最新政策 | 政策解读 | 图解政策    |
 | -------- | -------- | ----------- |
 | zuixin   | jiedu    | jiedu/tujie |`,
 };
 
-export async function handler(ctx) {
-    const { category = 'zuixin' } = ctx.req.param();
-    const limit = ctx.req.query('limit') ? Number(ctx.req.query('limit')) : 20;
+const policyLinkPattern = /https?:\/\/www\.gov\.cn\/zhengce(?:\/[^/]+)*\/content_\d+\.htm/;
 
-    const rootUrl = 'https://www.gov.cn';
-    const currentUrl = new URL(`zhengce/${category.replace(/\/$/, '')}/`, rootUrl).href;
+type ZuixinPolicyEntry = {
+    TITLE: string;
+    URL: string;
+    DOCRELPUBTIME?: string;
+};
 
-    const { data: response } = await got(currentUrl);
+const loadZuixinItemsFromJson = async (currentUrl: string, limit: number): Promise<DataItem[]> => {
+    const jsonUrl = new URL('ZUIXINZHENGCE.json', currentUrl).href;
+    const { data } = await got(jsonUrl);
 
-    const $ = load(response);
+    if (!Array.isArray(data)) {
+        return [];
+    }
 
-    let items = $('h4 a, div.subtitle a[title]')
+    return (data as ZuixinPolicyEntry[])
+        .filter((entry) => entry.URL && entry.TITLE)
+        .slice(0, limit)
+        .map((entry) => ({
+            title: entry.TITLE,
+            link: entry.URL,
+            ...(entry.DOCRELPUBTIME && {
+                pubDate: timezone(parseDate(entry.DOCRELPUBTIME, 'YYYY-MM-DD'), 8),
+            }),
+        }));
+};
+
+const loadItemsFromHtml = ($: ReturnType<typeof load>, currentUrl: string) =>
+    $('h4 a, div.subtitle a[title]')
         .toArray()
         .map((item): DataItem => {
             const $item = $(item);
@@ -56,11 +76,45 @@ export async function handler(ctx) {
                 title: $item.text(),
                 link: link!.startsWith('http') ? link : new URL(link!, currentUrl).href,
             };
-        });
+        })
+        .filter((item) => policyLinkPattern.test(item.link!));
+
+export async function handler(ctx) {
+    const { category = 'zuixin' } = ctx.req.param();
+    const limit = ctx.req.query('limit') ? Number(ctx.req.query('limit')) : 20;
+
+    const rootUrl = 'https://www.gov.cn';
+    const normalizedCategory = category.replace(/\/$/, '');
+    const currentUrl = new URL(`zhengce/${normalizedCategory}/`, rootUrl).href;
+
+    let items: DataItem[] = [];
+
+    if (normalizedCategory === 'zuixin') {
+        try {
+            items = await loadZuixinItemsFromJson(currentUrl, limit);
+        } catch {
+            // Fall back to HTML when the JSON feed is unavailable.
+        }
+    }
+
+    let $: ReturnType<typeof load>;
+
+    try {
+        const { data: response } = await got(currentUrl);
+        $ = load(response);
+    } catch (error) {
+        if (items.length === 0) {
+            throw error;
+        }
+        $ = load('<html><head><title>最新政策_政策_中国政府网</title></head></html>');
+    }
+
+    if (items.length === 0) {
+        items = loadItemsFromHtml($, currentUrl);
+    }
 
     items = await Promise.all(
         items
-            .filter((item) => /https?:\/\/www\.gov\.cn\/zhengce.*content_\d+\.htm/.test(item.link!))
             .slice(0, limit)
             .map((item) =>
                 cache.tryGet(item.link!, async () => {
@@ -99,7 +153,10 @@ export async function handler(ctx) {
                     item.author = [agency, source, author].filter(Boolean).join('/');
                     item.category = [...new Set([subject, column, ...keywords].filter(Boolean))];
                     item.guid = `gov-zhengce-${manuscriptId}`;
-                    item.pubDate = timezone(parseDate(content('meta[name="firstpublishedtime"]').prop('content'), 'YYYY-MM-DD-HH:mm:ss'), 8);
+                    const detailPubDate = content('meta[name="firstpublishedtime"]').prop('content');
+                    item.pubDate = detailPubDate
+                        ? timezone(parseDate(detailPubDate, 'YYYY-MM-DD-HH:mm:ss'), 8)
+                        : item.pubDate;
                     item.updated = timezone(parseDate(content('meta[name="lastmodifiedtime"]').prop('content'), 'YYYY-MM-DD-HH:mm:ss'), 8);
 
                     return item;
@@ -107,8 +164,10 @@ export async function handler(ctx) {
             )
     );
 
-    const image = new URL($('img.wordlogo').prop('src')!, rootUrl).href;
-    const icon = new URL($('link[rel="icon"]').prop('href')!, rootUrl).href;
+    const imageSrc = $('img.wordlogo').prop('src');
+    const iconHref = $('link[rel="icon"]').prop('href');
+    const image = imageSrc ? new URL(imageSrc, rootUrl).href : undefined;
+    const icon = iconHref ? new URL(iconHref, rootUrl).href : undefined;
     const subtitle = $('meta[name="lanmu"]').prop('content');
     const author = $('div.header_logo a[aria-label]').prop('aria-label');
 
